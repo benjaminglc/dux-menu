@@ -1,41 +1,15 @@
-# Compiled Lua sources
-luac.out
+# Test screenshots
+tests/out/
 
-# luarocks build files
-*.src.rock
-*.zip
-*.tar.gz
+# Backups made by install.sh
+*.bak
 
-# Object files
-*.o
-*.os
-*.ko
-*.obj
-*.elf
+# Python
+__pycache__/
+*.pyc
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Libraries
-*.lib
-*.a
-*.la
-*.lo
-*.def
-*.exp
-
-# Shared objects (inc. Windows DLLs)
-*.dll
-*.so
-*.so.*
-*.dylib
-
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
-
+# Editors
+*.swp
+*~
+.vscode/
+.idea/
