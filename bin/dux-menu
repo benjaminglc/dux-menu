@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# dux-menu: Omarchy-style menu built on Dux Shell's own picker (dms dmenu).
+#
+#   dux-menu [menu|apps|style|setup|install|remove|update|about|system]
+#
+# Typing right away in the main menu searches: the Apps row is "permanent", so
+# it stays visible when the text matches no menu entry, and Enter on it opens
+# Spotlight with that text (apps, settings, files, commands).
+#
+# Edge cases below were found by testing dms 2.0/2.1 + Hyprland 0.56/0.57:
+#  - A second `dms dmenu` queues behind an open one instead of replacing it,
+#    so a repeated key press closes the open picker over IPC (toggle).
+#  - `spotlight open` while a picker is up strands that picker's client and
+#    every later picker then waits forever with nothing on screen. Apps
+#    therefore closes the menu first, and a stranded owner is cleared.
+#  - A click outside, the toggle key and another Dux panel opening all end the
+#    picker with exit code 1, same as Esc. Esc is therefore bound as a custom
+#    accept key (exit code 10), so only a real Esc goes back to the parent menu.
+#    That only works without --no-custom (Esc does nothing once a filter
+#    matches no row), so typed text is accepted and handled here.
+#  - After a stranded picker is cleared, the next picker can cancel itself
+#    once right away; that case is retried once.
+#  - Row icons are icon-theme names (Material Symbols only work for the prompt
+#    badge), so menu rows use standard freedesktop names. They follow the icon
+#    theme set in Dux Settings > Theme > Icons.
+
+set -u
+
+SELF=$(readlink -f "$0")
+STATE="${XDG_RUNTIME_DIR:-/tmp}/dux-menu"
+OWNER="$STATE/owner"   # pid of the dux-menu process that shows the menu
+DMENU="$STATE/dmenu"   # pid of its current dms dmenu client
+TERM_CLASS="dux.menu.float"
+RECOVERED=0
+
+mkdir -p "$STATE"
+
+has() { command -v "$1" >/dev/null 2>&1; }
+ipc() { dms ipc call "$@" >/dev/null 2>&1; }
+layers() { hyprctl layers -j 2>/dev/null | jq -r '.[].levels[][].namespace'; }
+picker_visible() { layers | grep -qx 'dms:spotlight'; }
+
+alive() { # alive PIDFILE: print the pid if that process is still running
+	local p
+	p=$(cat "$1" 2>/dev/null) || return 1
+	[ -n "$p" ] && kill -0 "$p" 2>/dev/null || return 1
+	echo "$p"
+}
+
+owner_pid() {
+	local p
+	p=$(alive "$OWNER") || return 1
+	grep -qa dux-menu "/proc/$p/cmdline" 2>/dev/null || return 1
+	echo "$p"
+}
+
+clear_owner() { # kill a menu owner and its picker client
+	local p=$1 d
+	d=$(alive "$DMENU") && kill "$d" 2>/dev/null
+	kill "$p" 2>/dev/null
+	rm -f "$OWNER" "$DMENU"
+	RECOVERED=1
+}
+
+release() { [ "$(cat "$OWNER" 2>/dev/null)" = "$$" ] && rm -f "$OWNER" "$DMENU"; }
+
+# Become the menu owner. Returns 1 when an open menu was closed instead (toggle).
+claim() {
+	local p
+	exec 9>"$STATE/lock"
+	flock -w 2 9
+	if p=$(owner_pid); then
+		# Between two pickers the layer is briefly gone, so look a few times
+		for _ in 1 2 3 4 5; do
+			if picker_visible; then
+				ipc spotlight close
+				flock -u 9
+				return 1
+			fi
+			sleep 0.1
+		done
+		clear_owner "$p" # owner alive but nothing on screen: stranded
+	fi
+	echo $$ >"$OWNER"
+	trap release EXIT
+	flock -u 9
+}
+
+# row LABEL ICON [ID [permanent]]: one picker row; ID defaults to LABEL.
+# A permanent row stays visible even when the typed text doesn't match it.
+row() {
+	printf '%s\0icon\x1f%s\x1finfo\x1f%s' "$1" "$2" "${3:-$1}"
+	[ -n "${4:-}" ] && printf '\x1fpermanent\x1ftrue'
+	printf '\n'
+}
+
+# pick PROMPT ICON [free] <rows: prints the chosen row's ID, and with "free"
+# "ID<TAB>TYPED TEXT". Enter on typed text that matches no row
+# shows the menu again. Returns 0 on a choice, 1 to go back (Esc),
+# 2 to close everything.
+pick() {
+	local prompt=$1 icon=$2 free=${3:-} rows out rc start tries=0 text id fmt=s
+	rows=$(mktemp "$STATE/rows.XXXXXX")
+	out=$(mktemp "$STATE/out.XXXXXX")
+	cat >"$rows"
+	[ -n "$free" ] && fmt=f # print the typed text instead of the row's label
+	while :; do
+		start=$(date +%s%N)
+		dms dmenu -p "$prompt" --icon "$icon" --format "$fmt" --print-info --keybind 1=escape \
+			--input "$rows" >"$out" 2>/dev/null &
+		echo $! >"$DMENU"
+		wait $!
+		rc=$?
+		if [ $rc -eq 0 ]; then
+			text=$(sed -n 1p "$out")
+			id=$(sed -n 2p "$out")
+			[ -n "$id" ] || continue # typed text that matches no row
+			rm -f "$rows" "$out"
+			if [ -n "$free" ]; then printf '%s\t%s\n' "$id" "$text"; else echo "$id"; fi
+			return 0
+		fi
+		# Right after clearing a stranded picker the next one may cancel itself
+		if [ $rc -eq 1 ] && [ $RECOVERED -eq 1 ] && [ $tries -eq 0 ] &&
+			[ $(($(date +%s%N) - start)) -lt 500000000 ]; then
+			tries=1
+			continue
+		fi
+		rm -f "$rows" "$out"
+		[ $rc -eq 10 ] && return 1 # Esc
+		[ $rc -eq 2 ] && notify-send -a dux-menu "Menu" "Dux Shell is not reachable" 2>/dev/null
+		return 2
+	done
+}
+
+# run_in_term TITLE TASK: run one of the __task functions in a floating terminal
+run_in_term() {
+	setsid -f ghostty --class="$TERM_CLASS" --title="$1" -e "$SELF" __task "$2" >/dev/null 2>&1
+}
+
+settings() { ipc settings openWith "$1"; }
+
+apps() {
+	local p
+	if p=$(owner_pid); then
+		# Never open Spotlight over a live picker: that strands the menu
+		ipc spotlight close
+		for _ in $(seq 10); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+		kill -0 "$p" 2>/dev/null && clear_owner "$p"
+		ipc spotlight open
+	else
+		ipc spotlight toggle
+	fi
+}
+
+# --- Menus. Each returns 0 when done, 1 to go back, 2 to close everything ---
+
+menu_style() {
+	local c
+	c=$({
+		row Wallpaper preferences-desktop-wallpaper
+		row "Light / Dark" weather-clear-night
+		row Theme preferences-desktop-theme
+		row Fonts preferences-desktop-font
+		row Bar preferences-desktop
+	} | pick Style palette) || return
+	case $c in
+	Wallpaper) ipc wallpaperCarousel open ;;
+	"Light / Dark") ipc theme toggle ;;
+	Theme) settings theme ;;
+	Fonts) settings typography ;;
+	Bar) settings dankbar ;;
+	esac
+	return 0
+}
+
+menu_setup() {
+	local c
+	c=$({
+		row Displays preferences-desktop-display
+		row Audio audio-card
+		has pavucontrol && row "Volume Control" multimedia-volume-control
+		row Network network-wireless
+		row Keyboard input-keyboard
+		row "Mouse & Touchpad" input-mouse
+		row Keybinds preferences-desktop-keyboard-shortcuts
+		row "Default Apps" applications-system
+		row Autostart system-run
+		row "Power & Sleep" battery
+		row "Window Rules" preferences-system-windows
+	} | pick Setup settings) || return
+	case $c in
+	Displays) settings displays ;;
+	Audio) settings audio ;;
+	"Volume Control") setsid -f pavucontrol >/dev/null 2>&1 ;;
+	Network) settings network ;;
+	Keyboard) settings keyboard ;;
+	"Mouse & Touchpad") settings mouse_touchpad ;;
+	Keybinds) settings keybinds ;;
+	"Default Apps") settings default_apps ;;
+	Autostart) settings autostart ;;
+	"Power & Sleep") settings power_sleep ;;
+	"Window Rules") settings window_rules ;;
+	esac
+	return 0
+}
+
+menu_install() {
+	local c
+	c=$({
+		has paru && has fzf && row Package package-x-generic
+		has flatpak && has fzf && row Flatpak application-x-addon
+	} | pick Install download) || return
+	case $c in
+	Package) run_in_term "Install package" install_pkg ;;
+	Flatpak) run_in_term "Install Flatpak" install_flatpak ;;
+	esac
+	return 0
+}
+
+menu_remove() {
+	local c
+	c=$({
+		has paru && has fzf && row Package package-x-generic
+		has flatpak && has fzf && row Flatpak application-x-addon
+	} | pick Remove delete) || return
+	case $c in
+	Package) run_in_term "Remove package" remove_pkg ;;
+	Flatpak) run_in_term "Remove Flatpak" remove_flatpak ;;
+	esac
+	return 0
+}
+
+menu_update() {
+	local c
+	c=$({
+		{ has arch-update || has paru; } && row System software-update-available
+		row "Dux Plugins" application-x-addon
+		has fwupdmgr && row Firmware drive-harddisk
+		has cachyos-rate-mirrors && row Mirrors network-server
+	} | pick Update system_update) || return
+	case $c in
+	System) run_in_term "Update system" update_system ;;
+	"Dux Plugins") run_in_term "Update Dux plugins" update_plugins ;;
+	Firmware) run_in_term "Update firmware" update_firmware ;;
+	Mirrors) run_in_term "Rank mirrors" update_mirrors ;;
+	esac
+	return 0
+}
+
+menu_main() {
+	local c r text rows
+	rows=$(mktemp "$STATE/main.XXXXXX")
+	{
+		row Apps applications-other m:apps permanent
+		row Style preferences-desktop-theme m:style
+		row Setup preferences-system m:setup
+		if { has paru || has flatpak; } && has fzf; then
+			row Install system-software-install m:install
+			row Remove user-trash m:remove
+		fi
+		row Update software-update-available m:update
+		has fastfetch && row About help-about m:about
+		row System system-shutdown m:system
+	} >"$rows"
+	while :; do
+		c=$(pick Menu menu free <"$rows") || break
+		text=${c#*$'\t'}
+		c=${c%%$'\t'*}
+		r=0
+		case $c in
+		m:apps) # the picker has exited, so opening Spotlight is safe
+			if [ -n "$text" ]; then ipc spotlight openQuery "$text"; else ipc spotlight open; fi ;;
+		m:style) menu_style; r=$? ;;
+		m:setup) menu_setup; r=$? ;;
+		m:install) menu_install; r=$? ;;
+		m:remove) menu_remove; r=$? ;;
+		m:update) menu_update; r=$? ;;
+		m:about) run_in_term About about ;;
+		m:system) ipc powermenu open ;;
+		esac
+		[ $r -eq 1 ] || break # Esc in a submenu comes back here
+	done
+	rm -f "$rows"
+	return 0
+}
+
+# --- Tasks that run inside the floating terminal ---
+
+pause() { printf '\nPress any key to close.'; read -rsn1; }
+
+task_install_pkg() {
+	local p
+	p=$(paru -Slq | sort -u | fzf --multi --prompt 'Install> ' \
+		--preview 'paru -Si {1}' --preview-window 'right,60%,wrap') || return
+	# shellcheck disable=SC2086
+	paru -S --needed $p
+}
+
+task_remove_pkg() {
+	local p
+	p=$(paru -Qeq | fzf --multi --prompt 'Remove> ' \
+		--preview 'paru -Qi {1}' --preview-window 'right,60%,wrap') || return
+	# shellcheck disable=SC2086
+	paru -Rns $p
+}
+
+task_install_flatpak() {
+	local p
+	p=$(flatpak remote-ls --app --columns=application flathub | sort -u |
+		fzf --multi --prompt 'Install Flatpak> ' \
+			--preview 'flatpak remote-info flathub {1}' --preview-window 'right,60%,wrap') || return
+	# shellcheck disable=SC2086
+	flatpak install flathub $p
+}
+
+task_remove_flatpak() {
+	local p
+	p=$(flatpak list --app --columns=application | fzf --multi --prompt 'Remove Flatpak> ' \
+		--preview 'flatpak info {1}' --preview-window 'right,60%,wrap') || return
+	# shellcheck disable=SC2086
+	flatpak uninstall $p
+}
+
+task_update_system() { if has arch-update; then arch-update; else paru -Syu; fi; }
+task_update_plugins() { dms plugins update --all; }
+task_update_firmware() { fwupdmgr refresh && fwupdmgr get-updates && fwupdmgr update; }
+task_update_mirrors() { sudo cachyos-rate-mirrors; }
+task_about() { fastfetch; }
+
+# --- Entry ---
+
+case "${1:-menu}" in
+__task)
+	"task_$2"
+	pause
+	;;
+apps) apps ;;
+menu) claim && menu_main ;;
+style | setup | install | remove | update)
+	claim && "menu_$1" ;;
+about) run_in_term About about ;;
+system) ipc powermenu toggle ;;
+*)
+	echo "usage: dux-menu [menu|apps|style|setup|install|remove|update|about|system]" >&2
+	exit 64
+	;;
+esac
+exit 0
